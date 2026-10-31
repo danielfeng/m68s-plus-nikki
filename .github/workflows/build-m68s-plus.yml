@@ -86,6 +86,8 @@ jobs:
           done
           grep -q '^CONFIG_TARGET_rockchip_armv8_DEVICE_ezpro_mrkaio-m68s=y' .config && \
             { echo "::error::误选普通版 m68s"; exit 1; } || true
+          grep -q '^CONFIG_PACKAGE_libustream-mbedtls=y' .config && \
+            { echo "::error::libustream-mbedtls 与 libustream-openssl 冲突"; exit 1; } || true
 
       - name: SSH (optional)
         if: ${{ inputs.ssh }}
