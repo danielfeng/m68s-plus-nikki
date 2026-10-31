@@ -1,0 +1,133 @@
+name: Build M68S-Plus (LEDE + Nikki)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: '编译前进入 SSH 调试 (make menuconfig)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 20 * * 5'   # 每周六 04:00 (UTC+8)
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  CONFIG_FILE: config/m68s-plus.config
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib \
+            gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev \
+            libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool \
+            llvm lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+            python3-ply python3-docutils python3-pyelftools qemu-utils re2c rsync scons squashfs-tools \
+            subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: Clone LEDE
+        run: |
+          git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
+          echo "LEDE_COMMIT=$(git -C openwrt rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: DIY part1 (feeds.conf)
+        run: cd openwrt && bash "$GITHUB_WORKSPACE/scripts/diy-part1.sh"
+
+      - name: Update feeds
+        run: cd openwrt && ./scripts/feeds update -a
+
+      - name: DIY part2
+        run: cd openwrt && bash "$GITHUB_WORKSPACE/scripts/diy-part2.sh"
+
+      - name: Install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds install -a
+          # 强制使用 nikki 源里的包 (防止同名包被其它源抢先)
+          ./scripts/feeds install -a -f -p nikki
+
+      - name: Load config
+        run: |
+          [ -d files ] && cp -r files openwrt/files || true
+          cp "$CONFIG_FILE" openwrt/.config
+          cd openwrt && make defconfig
+          # 校验：机型、fw4、tproxy、nikki 必须全部为 y，否则直接失败
+          for s in \
+            CONFIG_TARGET_rockchip_armv8_DEVICE_ezpro_mrkaio-m68s-plus \
+            CONFIG_PACKAGE_firewall4 CONFIG_PACKAGE_kmod-nft-tproxy \
+            CONFIG_PACKAGE_nikki CONFIG_PACKAGE_mihomo-meta CONFIG_PACKAGE_luci-app-nikki; do
+            grep -q "^$s=y" .config || { echo "::error::$s 未启用"; exit 1; }
+          done
+          grep -q '^CONFIG_TARGET_rockchip_armv8_DEVICE_ezpro_mrkaio-m68s=y' .config && \
+            { echo "::error::误选普通版 m68s"; exit 1; } || true
+
+      - name: SSH (optional)
+        if: ${{ inputs.ssh }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j8
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile
+        run: |
+          cd openwrt
+          echo "Building with $(nproc) threads"
+          make -j$(nproc) || make -j1 V=s
+          echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+
+      - name: Collect firmware
+        run: |
+          cd openwrt/bin/targets/rockchip/armv8
+          rm -rf packages *.buildinfo *.manifest feeds.buildinfo version.buildinfo
+          ls -lh
+          ls *ezpro_mrkaio-m68s-plus*sysupgrade.img.gz
+          echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: m68s-plus-nikki-${{ env.BUILD_DATE }}
+          path: ${{ env.FIRMWARE }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: m68s-plus-${{ env.BUILD_DATE }}
+          name: M68S-Plus Nikki ${{ env.BUILD_DATE }}
+          body: |
+            源码: coolsnowwolf/lede@${{ env.LEDE_COMMIT }}
+            机型: rockchip/armv8 ezpro_mrkaio-m68s-plus
+            防火墙: firewall4 (nftables)  代理: Nikki + mihomo-meta
+            刷机文件: *-ezpro_mrkaio-m68s-plus-squashfs-sysupgrade.img.gz
+          files: ${{ env.FIRMWARE }}/*
